@@ -88,6 +88,30 @@ TYPING_START, TYPING_STOP = 1, 2
 SESSION_EXPIRED_ERRCODE = -14     # 会话过期：去掉 context_token 重试即可
 RATE_LIMIT_ERRCODE = -2           # 频率限制：退避后重试
 
+#: 按错误类型定的退避方案：``(起始间隔秒, 倍率, 单次上限秒, 最少尝试次数)``。
+#: 参数来自实测 —— 2026-09-16 那次 ret=-2 中断持续了约 2.5 分钟，
+#: 而原来是 1s/2s/3s 的线性退避、总共只等 6 秒，根本等不到服务端恢复。
+#: 所以把「限流 / 对话未就绪」这两类的最小尝试次数抬到 6 次、起始 10 秒：
+#: 10 + 16 + 25.6 + 30 + 30 ≈ 112 秒，覆盖实测的中断时长。
+_BACKOFF_PLAN = {
+    "rate_limit":      (10.0, 1.6, 30.0, 6),
+    "session_pending": (10.0, 1.6, 30.0, 6),
+    "network":         (2.0, 2.0, 15.0, 4),
+    "server":          (2.0, 2.0, 15.0, 3),
+}
+_BACKOFF_DEFAULT = (1.0, 2.0, 8.0, 3)
+
+
+def backoff_plan(kind: str, retries: int) -> Tuple[float, float, float, int]:
+    """返回 ``(起始间隔, 倍率, 单次上限, 最大尝试次数)``。"""
+    base, factor, cap, floor = _BACKOFF_PLAN.get(kind, _BACKOFF_DEFAULT)
+    return base, factor, cap, max(int(retries), floor)
+
+
+def backoff_wait(base: float, factor: float, cap: float, attempt: int) -> float:
+    """第 ``attempt`` 次失败后的等待秒数（attempt 从 1 开始）。"""
+    return min(cap, base * (factor ** max(0, attempt - 1)))
+
 MAX_MESSAGE_LENGTH = 2000         # iLink 单条文本上限（约 2048，留点余量）
 SPLIT_THRESHOLD = 1800            # 超过就先切片，避免被服务端硬切
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
@@ -96,7 +120,26 @@ _SSL_CTX: Optional[ssl.SSLContext] = None
 
 
 class IlinkError(RuntimeError):
-    """iLink 调用失败（网络、HTTP 或业务 ret/errcode 非 0）"""
+    """iLink 调用失败（网络、HTTP 或业务 ret/errcode 非 0）。
+
+    带三个分型字段，让上层能决定「要不要重试」和「该怎么跟人说」：
+
+    ``kind``
+        错误类型：``rate_limit`` / ``session_pending`` / ``session_expired`` /
+        ``network`` / ``server`` / ``local`` / ``unknown``。
+    ``retryable``
+        是否值得退避重试。**默认 False** —— 宁可漏判成不可重试，
+        也不要让一个不可能成功的请求把退避窗口耗光。
+    ``hint``
+        给人看的处置建议（**不是**给程序判断用的字符串，别再靠匹配中文来分支）。
+    """
+
+    def __init__(self, message: str, *, kind: str = "unknown",
+                 retryable: bool = False, hint: str = "") -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.retryable = retryable
+        self.hint = hint
 
 
 # ----------------------------- 通用工具 -----------------------------
@@ -361,11 +404,21 @@ class IlinkClient:
                 detail = exc.read()[:200].decode("utf-8", "replace")
             except Exception:
                 pass
-            raise IlinkError("HTTP %s %s -> %s %s" % (method, endpoint, exc.code, detail)) from exc
+            # 5xx / 429 是服务端或网关的瞬时状态，值得重试；4xx 是请求本身有问题
+            transient = exc.code >= 500 or exc.code == 429
+            raise IlinkError(
+                "HTTP %s %s -> %s %s" % (method, endpoint, exc.code, detail),
+                kind="network" if transient else "server",
+                retryable=transient,
+                hint="" if transient else "服务端拒绝了这次请求，多半是鉴权或参数问题，重试无用。",
+            ) from exc
         except urllib.error.URLError as exc:
-            raise IlinkError("网络错误 %s %s -> %s" % (method, endpoint, exc.reason)) from exc
-        except json.JSONDecodeError as exc:
-            raise IlinkError("响应不是合法 JSON: %s" % exc) from exc
+            raise IlinkError("网络错误 %s %s -> %s" % (method, endpoint, exc.reason),
+                             kind="network", retryable=True,
+                             hint="本地网络/代理问题，会自动重试。") from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise IlinkError("响应不是合法 JSON: %s" % exc, kind="protocol",
+                             hint="多半是代理或防火墙返回了拦截页，检查网络环境。") from exc
 
     def _post(self, endpoint: str, payload: Dict[str, Any], timeout: Optional[float] = None) -> Dict[str, Any]:
         body = json.dumps(
@@ -383,9 +436,13 @@ class IlinkClient:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout, context=_ssl_context()) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise IlinkError("HTTP GET %s -> %s" % (endpoint, exc.code)) from exc
+            transient = exc.code >= 500 or exc.code == 429
+            raise IlinkError("HTTP GET %s -> %s" % (endpoint, exc.code),
+                             kind="network" if transient else "server",
+                             retryable=transient) from exc
         except urllib.error.URLError as exc:
-            raise IlinkError("网络错误 GET %s -> %s" % (endpoint, exc.reason)) from exc
+            raise IlinkError("网络错误 GET %s -> %s" % (endpoint, exc.reason),
+                             kind="network", retryable=True) from exc
 
     @staticmethod
     def _check(resp: Dict[str, Any], what: str) -> Dict[str, Any]:
@@ -393,7 +450,12 @@ class IlinkClient:
         errcode = resp.get("errcode")
         if (ret not in (None, 0)) or (errcode not in (None, 0)):
             errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
-            raise IlinkError("%s 失败: ret=%s errcode=%s errmsg=%s" % (what, ret, errcode, errmsg))
+            hint = ""
+            if SESSION_EXPIRED_ERRCODE in (ret, errcode):
+                hint = "登录已失效，需要重新扫码（wechat_gateway.py login --new）。"
+            raise IlinkError("%s 失败: ret=%s errcode=%s errmsg=%s" % (what, ret, errcode, errmsg),
+                             kind="session_expired" if hint else "server",
+                             retryable=False, hint=hint)
         return resp
 
     @staticmethod
@@ -406,14 +468,29 @@ class IlinkClient:
             str(resp.get("errmsg") or "").lower() == "unknown error"
 
     @staticmethod
-    def _explain_ret2(resp: Dict[str, Any]) -> str:
-        """ret=-2 的两种含义：真限流 vs 会话没建立（prepare failed）"""
+    def _ret2_reason(resp: Dict[str, Any]) -> str:
+        """ret=-2 的原文（只用于拼消息，**不要**拿它做分支判断）"""
+        return "ret=-2 errmsg=%s" % (resp.get("errmsg") or resp.get("msg") or "?")
+
+    @staticmethod
+    def classify_ret2(resp: Dict[str, Any]) -> Tuple[str, str]:
+        """把 ret=-2 分成两类，返回 ``(kind, hint)``。
+
+        这两类**都要重试**，区别只在提示文案上：
+
+        * ``session_pending`` —— errmsg 里带 prepare / not found / no session。
+          文案曾经断言「重试也没用，让对方先发消息」，**这是错的**：
+          2026-09-16 实测同一条 `prepare failed` 连续失败约 2.5 分钟后自行恢复，
+          手工重试第 6 次就成功了。所以现在改成「先自动重试，持续失败再让人介入」。
+        * ``rate_limit`` —— 其余 ret=-2。
+        """
         errmsg = str(resp.get("errmsg") or resp.get("msg") or "").lower()
         if "prepare" in errmsg or "not found" in errmsg or "no session" in errmsg:
-            return ("iLink 拒绝发送（ret=-2 errmsg=%s）：与收件人的会话尚未建立。"
-                    "请让接收方先在微信里给机器人发一条消息（机器人才能回话），然后重试。"
-                    % (resp.get("errmsg") or resp.get("msg")))
-        return "iLink 频率限制（ret=-2 errmsg=%s）：稍后重试" % (resp.get("errmsg") or resp.get("msg"))
+            return ("session_pending",
+                    "iLink 报「对话未就绪」(prepare failed)。这类报错**多数是瞬时的**，"
+                    "工具会自己退避重试；若一直失败，再让对方在微信里给机器人发一条消息。")
+        return ("rate_limit",
+                "iLink 频率限制。工具会自己退避重试；仍失败就把长内容合并成一条，别连发多条。")
 
     # ---------- 账号 ----------
 
@@ -510,42 +587,85 @@ class IlinkClient:
         context_token: Optional[str] = None,
         client_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """发一条文本，内建重试：限流退避、会话过期去掉 context_token 重试"""
+        """发一条文本。重试策略见 :meth:`dispatch`。"""
         if not (text or "").strip():
-            raise IlinkError("文本为空，拒绝发送")
+            raise IlinkError("文本为空，拒绝发送", kind="local")
         item_list = [{"type": ITEM_TEXT, "text_item": {"text": text}}]
-        last_error: Optional[Exception] = None
+        return self.dispatch(item_list, to_user_id, context_token, client_id, what="发送文本")
+
+    def dispatch(
+        self,
+        item_list: List[Dict[str, Any]],
+        to_user_id: str,
+        context_token: Optional[str] = None,
+        client_id: Optional[str] = None,
+        what: str = "发送",
+    ) -> Dict[str, Any]:
+        """带**分型退避重试**地投递一条 item_list（文本和媒体共用这一套）。
+
+        重试次数不是固定值，按错误类型定（见 ``backoff_plan``）：
+        「限流 / 对话未就绪」最多 6 次、起始 10 秒，总窗口约 112 秒。
+
+        为什么非得这么长：2026-09-16 实测，一次 `ret=-2 prepare failed` 的中断
+        持续了约 2.5 分钟才自愈；当时是 1s/2s/3s 的线性退避、总共只等 6 秒，
+        于是每次发送都「干脆利落」地失败，最后靠人在 2.5 分钟里手工重试才发出去。
+
+        ``session_expired`` 会先摘掉 ``context_token`` 再试一次（这个是确定有效的）。
+        """
+        last_error: Optional[IlinkError] = None
         token = context_token
         dropped_token = False
-        for attempt in range(self.retries):
+        attempt = 0
+        max_attempts = self.retries
+
+        while attempt < max_attempts:
+            attempt += 1
             try:
                 resp = self.send_items(to_user_id, item_list, token, client_id)
                 ret, errcode = resp.get("ret"), resp.get("errcode")
                 if (ret not in (None, 0)) or (errcode not in (None, 0)):
                     if self._is_session_expired(resp) and token and not dropped_token:
                         dropped_token, token = True, None
+                        attempt -= 1                      # 换 token 不算一次尝试
                         self._log("会话过期，去掉 context_token 重试")
                         continue
                     if ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE:
-                        reason = self._explain_ret2(resp)
-                        if "会话尚未建立" in reason:
-                            raise IlinkError(reason)          # 重试也没用，直接给可执行的提示
-                        wait = self.retry_delay * 3 * (attempt + 1)
-                        self._log("%s，%.1fs 后重试" % (reason, wait))
+                        kind, hint = self.classify_ret2(resp)
+                        last_error = IlinkError(
+                            "iLink 拒绝%s（%s）" % (what, self._ret2_reason(resp)),
+                            kind=kind, retryable=True, hint=hint)
+                        base, factor, cap, max_attempts = backoff_plan(kind, self.retries)
+                        base = max(base, self.retry_delay)
+                        if attempt >= max_attempts:
+                            break
+                        wait = backoff_wait(base, factor, cap, attempt)
+                        self._log("%s；%.0fs 后重试（第 %d/%d 次）"
+                                  % (last_error, wait, attempt, max_attempts - 1))
                         time.sleep(wait)
-                        last_error = IlinkError(reason)
                         continue
-                    raise IlinkError("sendmessage 失败: ret=%s errcode=%s errmsg=%s"
-                                     % (ret, errcode, resp.get("errmsg") or resp.get("msg")))
+                    raise IlinkError(
+                        "%s失败: ret=%s errcode=%s errmsg=%s"
+                        % (what, ret, errcode, resp.get("errmsg") or resp.get("msg")),
+                        kind="server",
+                        hint="服务端明确拒绝，重试无用。看 errmsg 定位参数问题。")
                 return resp
             except IlinkError as exc:
                 last_error = exc
-                if attempt >= self.retries - 1:
+                if not exc.retryable:
                     break
-                wait = self.retry_delay * (attempt + 1)
-                self._log("发送失败(%s)，%.1fs 后重试 %d/%d" % (exc, wait, attempt + 1, self.retries))
+                base, factor, cap, max_attempts = backoff_plan(exc.kind, self.retries)
+                base = max(base, self.retry_delay)
+                if attempt >= max_attempts:
+                    break
+                wait = backoff_wait(base, factor, cap, attempt)
+                self._log("%s失败(%s)，%.0fs 后重试（第 %d/%d 次）"
+                          % (what, exc, wait, attempt, max_attempts - 1))
                 time.sleep(wait)
-        raise IlinkError("发送文本最终失败: %s" % last_error)
+
+        if last_error is None:                            # 理论上到不了这里
+            last_error = IlinkError("%s失败（无错误信息）" % what, kind="unknown")
+        raise IlinkError("%s最终失败：%s" % (what, last_error),
+                         kind=last_error.kind, retryable=False, hint=last_error.hint)
 
     def upload_media(self, path: str, to_user_id: str) -> Tuple[Dict[str, Any], int]:
         """上传一个本地文件到微信 CDN，返回 (可直接放进 item_list 的 item, media_type)"""
@@ -619,17 +739,10 @@ class IlinkClient:
         path: str,
         context_token: Optional[str] = None,
     ) -> Dict[str, Any]:
+        # 先上传（贵、且只需要做一次），再用和文本同一套分型退避去投递。
+        # 这样「上传成功了但投递遇到限流」不会白白重传一遍图。
         item, _mt = self.upload_media(path, to_user_id)
-        resp = self.send_items(to_user_id, [item], context_token)
-        ret, errcode = resp.get("ret"), resp.get("errcode")
-        if (ret not in (None, 0)) or (errcode not in (None, 0)):
-            if self._is_session_expired(resp) and context_token:
-                resp = self.send_items(to_user_id, [item], None)
-                ret, errcode = resp.get("ret"), resp.get("errcode")
-        if (ret not in (None, 0)) or (errcode not in (None, 0)):
-            raise IlinkError("发送媒体失败: ret=%s errcode=%s errmsg=%s"
-                             % (ret, errcode, resp.get("errmsg") or resp.get("msg")))
-        return resp
+        return self.dispatch([item], to_user_id, context_token, what="发送媒体")
 
 
 # ----------------------------- 扫码登录 -----------------------------

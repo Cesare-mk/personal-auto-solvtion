@@ -98,10 +98,12 @@ scripts\stop-all.bat
 :: 统一用 scripts\py —— 它转发到装了依赖的那个解释器（查找顺序见文件头注释）。
 :: 别直接用 PATH 上的 python：可能是 Anaconda base，缺 mss/qrcode。
 
-:: 常驻进程管理 —— 平时只用这三条
+:: 常驻进程管理
 scripts\py scripts\launcher.py status        :: 看两个常驻在不在（最常用）
-scripts\py scripts\launcher.py start         :: 起 / 补常驻（已在跑的不动）
+scripts\py scripts\launcher.py start         :: 起 / 补常驻（已在跑的不动；残留会先清掉）
 scripts\py scripts\launcher.py stop          :: 停常驻
+scripts\py scripts\launcher.py watch         :: 看门狗：掉了自动重起（前台，Ctrl+C 停）
+scripts\py scripts\launcher.py watch --once  :: 只体检一次
 
 :: 微信
 scripts\py src\wechat_gateway.py doctor            :: 自检
@@ -113,6 +115,8 @@ scripts\py src\wait_events.py --once      :: 只扫一遍，不阻塞
 scripts\py src\wait_events.py --status    :: 看账本（不会被单实例锁挡住）
 scripts\py src\wait_events.py --takeover  :: 有旧实例占着锁时，杀掉它并接管
 scripts\py tests\selftest.py              :: 离线自测（52 项）
+scripts\py tests\test_lock_log.py         :: 单实例锁 + 文件日志（22 项）
+scripts\py tests\test_send_retry.py       :: send 报错分型与退避（26 项）
 curl -s http://127.0.0.1:8799/health      :: 网关状态
 type runtime\logs\wechat_gateway.log      :: 网关日志（崩溃现场在这里）
 type runtime\logs\screenpeer.log          :: 截图端日志（热键有没有命中看这里）
@@ -131,8 +135,9 @@ scripts\py --pin <解释器路径>              :: 或显式指定
 | `Ctrl+\`` 按了没反应 | 截图端没在跑。`scripts\py scripts\launcher.py status` 查一下，再 `start` |
 | 按了热键但一直没答案 | 确认 Claude Code 会话**开着**——等待循环是它跑的，会话关了就没反应 |
 | 按了热键、没出图 | 看 `runtime\logs\screenpeer.log`：`触发截屏` = 热键命中了；`触发被节流跳过` = 两次按键间隔小于 2s 被有意丢弃（连按太快） |
-| 微信收不到答案 | 先看 `runtime\logs\wechat_gateway.log`。`send` 报 `prepare failed` **先别急着改配置**——等 10~30s 重试几次，多数会自愈；一直不行才是首次使用的**第 ③ 步**没做 |
+| 微信收不到答案 | 先看 `runtime\logs\wechat_gateway.log`。`send` 报 `prepare failed` 时会**自己重试近两分钟**，所以一旦它报失败，就说明等过了——这时让机器人在微信里先收到你的一条消息，再重发即可 |
 | 常驻进程莫名其妙没了 | 看 `runtime\logs\` 下对应的 `.log`（未捕获异常 / 后台线程异常 / 段错误都会落盘），再 `launcher.py start`。重启不丢消息 |
+| 想让它俩掉了自动重起 | `scripts\py scripts\launcher.py watch`，放着别关（前台进程，Ctrl+C 停）|
 | 截图端窗口一闪就没了 | 去窗口看报错，多半是解释器不对。用 `scripts\py --pin <解释器路径>` 固定正确的那一个 |
 | 微信里图片是灰块 | `aes_key` 参数被改坏了。别自己改协议，恢复 `src/ilink_client.py` |
 | token 失效 | `scripts\py src\wechat_gateway.py login --new` 重新扫码（必须你本人扫）|

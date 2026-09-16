@@ -618,6 +618,11 @@ def send_bundle(
     except IlinkError as exc:
         report["ok"] = False
         report["errors"].append(str(exc))
+        # 分型信息要带出去：调用方（CLI / HTTP / Skill）靠它决定下一步，
+        # 而不是去正则匹配错误文本里有没有「频率限制」四个字。
+        report["kind"] = getattr(exc, "kind", "unknown")
+        report["hint"] = getattr(exc, "hint", "")
+        log.warning("发送失败 kind=%s: %s", report["kind"], exc)
     finally:
         if do_typing and ticket and not dry_run:
             client.send_typing(target, ticket, TYPING_STOP)
@@ -859,7 +864,9 @@ def cmd_send(args: argparse.Namespace, cfg: Dict[str, Any], path: str, state: St
                              images=args.image or [], files=args.file or [],
                              typing=(None if args.typing is None else args.typing), dry_run=args.dry_run)
     except IlinkError as exc:
-        report = {"ok": False, "errors": [str(exc)]}
+        report = {"ok": False, "errors": [str(exc)],
+                  "kind": getattr(exc, "kind", "unknown"),
+                  "hint": getattr(exc, "hint", "")}
     if args.json:
         print(json.dumps(report, ensure_ascii=False))
     else:
@@ -867,6 +874,10 @@ def cmd_send(args: argparse.Namespace, cfg: Dict[str, Any], path: str, state: St
               % ("成功" if report.get("ok") else "失败", report.get("chunks", 0),
                  len(report.get("images", [])), len(report.get("files", [])),
                  ("  错误: " + "; ".join(report.get("errors", []))) if report.get("errors") else ""))
+        if not report.get("ok"):
+            print("[类型] %s" % report.get("kind", "unknown"))
+            if report.get("hint"):
+                print("[建议] %s" % report["hint"])
     return 0 if report.get("ok") else 1
 
 

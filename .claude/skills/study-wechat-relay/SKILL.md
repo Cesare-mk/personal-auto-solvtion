@@ -42,9 +42,23 @@ cd "$(git rev-parse --show-toplevel)"
 **先查再起**，`start` 是幂等的（在跑的不动，只补缺的）：
 
 ```bash
-scripts/py scripts/launcher.py status
-scripts/py scripts/launcher.py start
+scripts/py scripts/launcher.py status     # 谁在跑、谁没跑
+scripts/py scripts/launcher.py start      # 缺哪个补哪个
 ```
+
+`start` 现在还会**先腾地方**：如果某个常驻的进程还在、但健康检查不通过，
+它会先杀掉那个残留再拉新的——否则会出现两个网关同时长轮询、重复消费同一条消息。
+它先等约 6 秒（区分「正在启动」和「真死了」），等不到才动手。
+
+> **建议每次开工顺手挂一个看门狗**（会话里作为后台任务跑，不占窗口）：
+>
+> ```bash
+> scripts/py scripts/launcher.py watch --interval 30
+> ```
+>
+> 它每 30 秒确认一次两个常驻还在不在，掉了自动补起来，并写
+> `runtime/logs/watchdog.log`。同一个组件 10 分钟内重启超过 5 次会停手喊人
+> （避免刷窗口），那时去看日志找根因。只用 `watch --once` 可以做一次性体检。
 
 > 用户也可能已经用 `scripts\start-all.bat` 起好了。下次进来先 `status` 查一下，在跑就直接进等待。
 >
@@ -229,7 +243,7 @@ scripts/py src/wechat_gateway.py send --text "…思路…
 
 | 现象 | 处理 |
 |---|---|
-| `send` 报 **prepare failed / 会话尚未建立** | ⚠️ 这个报错**指向不可靠**：限流、会话过期、服务端抖动都会套用同一句话。别急着让用户去发消息——**先按 10~30s 间隔重试 3~5 次**，多数会自愈（实测第 6 次成功）。仍不行再让用户给机器人发一条消息 |
+| `send` 报 **prepare failed** | **现在会自动重试了**（限流/未就绪类最多 6 次、起始 10s，总窗口约 112s）。所以一次 `send` 失败 = 它已经自己等过近两分钟。此时再让用户给机器人发一条消息，然后重发一次 |
 | `send` 报 **ret=-2（频率限制）** | 等 10~30s 再发；长内容合并成一条，别连发多条 |
 | 想知道 `send` 到底卡在哪 | **`send` 不依赖常驻网关**（进程内直连 iLink，2026-09-16 核实）。所以「发不出去」和「网关死没死」是两件独立的事，别混为一谈：网关挂了照发不误，发不出去也未必是网关的锅 |
 | `send` 报 **HTTP 4xx / 网络错误** | `scripts/py src/wechat_gateway.py doctor`；token 失效就 `login --new` 重新扫码（**二维码必须用户本人扫**，你扫不了）|
@@ -239,7 +253,7 @@ scripts/py src/wechat_gateway.py send --text "…思路…
 | 图片读不出来（坏文件/半截） | 跳过它处理其余事件，并回一条「这张图读取失败，麻烦重截」 |
 | 截图里**没有题目**（截到桌面/聊天窗）| 回一条「没识别到题目，请把题面放到屏幕可见处再按一次」，然后**立刻回去等待**，不要假装答过 |
 | 用户在微信里发的是**纯聊天/催问** | 直接回，不走解题流程；同时继续等待 |
-| 网关 / 截图端挂了 | **先看 `runtime/logs/` 下对应的 .log**（未捕获异常、后台线程异常、段错误都在里面）→ 再 `scripts/py scripts/launcher.py start` 拉起。收件箱是追加写，重启不丢消息 |
+| 网关 / 截图端挂了 | **先看 `runtime/logs/` 下对应的 .log**（未捕获异常、后台线程异常、段错误都在里面）→ 再 `scripts/py scripts/launcher.py start` 拉起（它会先清掉赖着但不健康的残留，再拉新的）。收件箱是追加写，重启不丢消息 |
 | `wait_events` 报「已有一个在跑，拒绝启动」（退出码 3） | 正常保护。确认是上个会话的遗留就 `--takeover`；只想看状态用 `--status` |
 | 用户按了 Ctrl+` 但没出图 | 看 `runtime/logs/screenpeer.log`：`触发截屏` 说明热键命中了（问题在发送/落盘）；**`触发被节流跳过`** 说明两次按键间隔小于 `cooldown`（默认 2s），被有意丢弃了 |
 | 起不来 / 端口被占 / 改了配置不生效 | 看 `README.md` 的「出问题怎么办」和 `docs/ADAPTATION.md` |
