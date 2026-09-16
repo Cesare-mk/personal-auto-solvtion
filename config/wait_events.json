@@ -1,0 +1,57 @@
+{
+  // ============================================================
+  //  wait_events.py 的配置（学习场景阻塞轮询）
+  //  相对路径都相对于**项目根**（本文件所在目录的上一级）；// 与 /* */ 注释合法。
+  //  命令行参数（--interval/--idle-timeout/--dir…）会覆盖这里的值。
+  // ============================================================
+  "_readme": "阻塞等待「新截图 + 微信新消息」，打印名字，空闲 N 秒后安全退出",
+
+  // ---- 监听哪些源 ----
+  "sources": ["shots", "wechat"],
+
+  // ---- 截图源 ----
+  "shot_dirs": ["runtime/shots"],                          // screenpeer 的落盘目录（可多个）
+  "globs": ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"], // 只认这些后缀
+  "ignore_suffixes": [".part", ".tmp", ".crdownload", ".download", ".partial"],
+  "ignore_prefixes": [".", "~$", "._"],                     // 隐藏文件 / 系统缩略图 / Office 临时文件
+  "stability_check": true,                                  // 连续两轮 大小+mtime 一致才上报（防读到半截文件）
+  "shots_cold_start_lookback_sec": 0,                       // 首次运行：>0 则把最近 N 秒内的旧图也算新事件
+
+  // ---- 截图端（start_capture.py 读这一段；与轮询脚本共用配置，保证目录永不打架）----
+  "capture": {
+    "peer": "self",         // "self"=本机自收（截图直接落盘，无需第二台机器）；或对方 IP（局域网互传）
+    "port": 5091,           // 端口，随便改；局域网互传时两端必须填一样
+    "cooldown_sec": 2.0,    // 两次截图最小间隔，防连按刷屏（0=不节流）
+    "auto_port": true,      // 端口被占：true=自动改用下一个空闲端口（会打印谁占着）；
+                            // false=直接报错退出，绝不偷偷换（想「固定就是这个端口」就用 false）
+    "save_dir": ""          // 留空 = 用下面的 shot_dirs[0]
+  },
+
+  // ---- 轮询节奏 ----
+  "poll_interval_sec": 2.0,     // 每 2 秒扫一遍
+  "idle_timeout_sec": 10.0,     // 打印过事件之后，空闲超过 10 秒 → 安全退出。
+                                // 注意：**一个事件都没打印过时永远不退出**（一直阻塞等第一个事件）；0=打印过也不退出
+  "max_wait_sec": 0,            // 整个进程的总时长硬上限（0=不限）。零事件阻塞时唯一的自动退出口
+
+  // ---- 状态（保证「打印过的名字永不重复打印」）----
+  "state_file": "runtime/state/wait_events_state.json",
+  "replay_unacked": true,       // 上一轮被 kill 掉、没走完确认流程的输出，下次运行以 REPLAY 重放
+  "max_seen": 4000,             // 账本最多记多少条文件名（超出淘汰最老的）
+
+  // ---- 微信源（wechat_gateway.py serve 会把消息写进收件箱）----
+  "wechat": {
+    "inbox_file": "runtime/wechat_inbox.jsonl",
+    "gateway_heartbeat": "runtime/state/wechat/heartbeat.json",
+    "require_gateway_fresh_sec": 0,  // >0：网关心跳超过该秒数就暂停微信源（默认 0=只要收件箱有文件就读）
+    "cold_start_lookback_sec": 300,  // 首次运行：最近 5 分钟的微信消息仍然算新（免得漏掉你刚发的问题）
+    "max_batch": 20                  // 单轮最多上报多少条微信消息（防刷屏）
+  },
+
+  // ---- 输出 ----
+  "output": {
+    "format": "lines",          // lines: "IMG <路径>" / "WX <用户说的话>"；json: 每行一个 JSON 对象
+    "wechat_show_meta": false,  // WX 行：false=只打印消息正文（+附件本地路径，无时间/msg_id 等噪音）
+                                //         true =打印完整 JSON（调试用，也可命令行加 --wechat-meta）
+    "banner": true              // 运行时打印头部信息（源、间隔、空闲阈值）
+  }
+}

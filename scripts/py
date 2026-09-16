@@ -1,0 +1,83 @@
+#!/bin/sh
+# 转发到「装了 mss / qrcode 的那个 Python」。
+#
+# 查找顺序（第一个命中的就用）：
+#   1. $ONE_AGENT_PYTHON            显式指定，最高优先级，不做探测
+#   2. <项目根>/.python-path        本机固定值（一行路径；**不入库**）
+#   3. <项目根>/.venv/Scripts/python.exe 或 .venv/bin/python
+#   4. PATH 上的 python3 / python   需能 import mss，否则跳过
+#
+# 为什么不直接用 PATH 上的 python：可能是 Anaconda base，缺 mss/qrcode，
+# 截图端和扫码登录会直接起不来 —— 所以第 4 步带一次探测。
+#
+# 固化本机解释器（换机器只做一次）：
+#   scripts/py --pin                 用当前选中的那个
+#   scripts/py --pin /path/to/python 用指定的那个
+#
+# 项目里不写死任何机器相关路径；机器相关的部分全在 .python-path（已被 .gitignore 排除）。
+
+set -u
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." 2>/dev/null && pwd) || {
+    echo "scripts/py: 无法定位项目根" >&2
+    exit 1
+}
+PIN_FILE="$ROOT/.python-path"
+
+probe_ok() {                       # 能 import mss 才算合格
+    [ -x "$1" ] || return 1
+    "$1" -c "import mss" >/dev/null 2>&1
+}
+
+pick_venv() {
+    for c in "$ROOT/.venv/Scripts/python.exe" "$ROOT/.venv/bin/python"; do
+        [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    return 1
+}
+
+pick_path() {
+    for n in python3 python; do
+        c=$(command -v "$n" 2>/dev/null) || continue
+        if probe_ok "$c"; then printf '%s' "$c"; return 0; fi
+    done
+    return 1
+}
+
+resolve_py() {
+    if [ -n "${ONE_AGENT_PYTHON:-}" ]; then
+        printf '%s' "$ONE_AGENT_PYTHON"; return 0
+    fi
+    if [ -f "$PIN_FILE" ]; then
+        c=$(sed -n '1{s/[[:space:]]*$//;p;}' "$PIN_FILE")
+        if [ -n "$c" ] && [ -x "$c" ]; then printf '%s' "$c"; return 0; fi
+    fi
+    pick_venv && return 0
+    pick_path && return 0
+    return 1
+}
+
+if [ "${1:-}" = "--pin" ]; then
+    shift
+    if [ -n "${1:-}" ]; then
+        target="$1"
+    else
+        target=$(resolve_py) || {
+            echo "scripts/py: 现在也找不到可用解释器，请显式给一个路径" >&2
+            exit 1
+        }
+    fi
+    printf '%s\n' "$target" > "$PIN_FILE"
+    echo "[scripts/py] 已固定解释器: $target"
+    echo "            记录在 $PIN_FILE（本机专用，不入库）"
+    exit 0
+fi
+
+PY=$(resolve_py) || {
+    echo "scripts/py: 找不到可用的 Python（需要能 import mss）。" >&2
+    echo "  · 装依赖见 README「首次使用」；" >&2
+    echo "  · 或显式指定：scripts/py --pin /path/to/python" >&2
+    exit 127
+}
+
+exec "$PY" "$@"

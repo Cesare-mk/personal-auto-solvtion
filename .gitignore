@@ -1,0 +1,36 @@
+# ---- 虚拟环境 ----
+.venv/
+venv/
+
+# ---- 本机解释器固定值（scripts/py --pin 写入）----
+# 每台机器的 Python 路径都不一样，不入库；换机器跑一次
+# `scripts/py --pin` 重新生成即可。
+.python-path
+
+# ---- Claude Code 的本机权限记录（含本机绝对路径与本机操作历史）----
+# 项目级 skill 在 .claude/skills/ 下，那部分是共享的；
+# 这里只排除本机专属的 settings.local.json。
+.claude/settings.local.json
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+
+# ---- 运行产物（截图 / 解题批次 / 收到的媒体 / 状态账本 / 收件箱 / 对端记忆）----
+runtime/
+
+# ---- 含 token 的凭据 ----
+# 首次运行 wechat_gateway.py 时会凭内置默认值自动生成这个文件，不必提交。
+# 注意：它和 config/wait_events.json 必须待在同一个目录——wait_events.py
+# 会去配置所在目录找它读默认收件人。
+config/wechat_gateway.json
+
+# ---- 扫码登录落盘的二维码 ----
+*.qr.png
+wechat_login_qr.png
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

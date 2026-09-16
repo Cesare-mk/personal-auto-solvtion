@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "permissions": {
+    "allow": [
+      "Bash(cd \"$(git rev-parse --show-toplevel)\")",
+
+      "Bash(scripts/py *)",
+      "Bash(sh scripts/py *)",
+
+      "Bash(curl -s http://127.0.0.1:8799/*)",
+
+      "Bash(mkdir -p runtime/work*)",
+
+      "Bash(javac *)",
+      "Bash(java -cp *)"
+    ]
+  }
+}

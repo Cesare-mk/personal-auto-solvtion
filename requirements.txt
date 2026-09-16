@@ -1,0 +1,19 @@
+# 学习中继的全部依赖。安装（在项目根执行）：
+#   py -3 -m venv .venv
+#   .venv\Scripts\python -m pip install -r requirements.txt
+#
+# 全部是纯 Python 包或官方 wheel，不需要编译器。
+
+pillow                  # 代码图渲染（code_image.py）
+pygments                # 代码着色
+cryptography            # 微信媒体 AES-128-ECB 加解密（ilink_client.py）
+qrcode[pil]             # 终端字符画 / PNG 二维码（扫码登录）
+mss                     # 截屏（screenpeer.py）
+
+# ---- 平台可选，用 PEP 508 标记自动跳过，不用手动删 ----
+
+# Linux 等平台的降级热键监听；Windows 走 WH_KEYBOARD_LL、macOS 走 CGEventTap，都不需要它
+pynput ; sys_platform != "win32" and sys_platform != "darwin"
+
+# macOS 专用（全局热键 CGEventTap）
+pyobjc-framework-Quartz ; sys_platform == "darwin"
